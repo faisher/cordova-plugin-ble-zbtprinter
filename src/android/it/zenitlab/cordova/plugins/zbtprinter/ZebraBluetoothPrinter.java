@@ -29,6 +29,7 @@ import com.zebra.sdk.printer.discovery.DiscoveryHandler;
 
 import org.apache.cordova.CallbackContext;
 import org.apache.cordova.CordovaPlugin;
+import org.apache.cordova.PluginResult;
 import org.json.JSONArray;
 import org.json.JSONException;
 
@@ -40,11 +41,14 @@ public class ZebraBluetoothPrinter extends CordovaPlugin implements DiscoveryHan
 
     private static final String LOG_TAG = "ZebraBluetoothPrinter";
     private CallbackContext callbackContext;
+    private CallbackContext discoveryCallbackContext; // callback dedicado da descoberta (nao compartilhar com o print)
     private boolean printerFound;
     private Connection thePrinterConn;
     private PrinterStatus printerStatus;
     private ZebraPrinter printer;
     private final int MAX_PRINT_RETRIES = 1;
+    private Connection cachedPrinterConn = null; // conexao bluetooth persistente entre impressoes (acelera o inicio da impressao)
+    private String cachedPrinterMac = "";
 
     public ZebraBluetoothPrinter() {
 
@@ -75,6 +79,7 @@ public class ZebraBluetoothPrinter extends CordovaPlugin implements DiscoveryHan
             }
             return true;
         } else if (action.equals("discoverPrinters")) {
+            discoveryCallbackContext = callbackContext; // callback dedicado: o resultado da descoberta nunca vaza para outras acoes (ex: print)
             discoverPrinters();
             return true;
         } else if (action.equals("getPrinterName")) {
@@ -142,6 +147,8 @@ public class ZebraBluetoothPrinter extends CordovaPlugin implements DiscoveryHan
             public void run() {
                 try {
 
+                    closeCachedConnection(); // evita duas conexoes simultaneas com a mesma impressora
+
                     Connection thePrinterConn = new BluetoothConnectionInsecure(mac);
 
                     Looper.prepare();
@@ -192,22 +199,28 @@ public class ZebraBluetoothPrinter extends CordovaPlugin implements DiscoveryHan
             public void run() {
                 try {
 
-                    // Instantiate insecure connection for given Bluetooth MAC Address.
-                    Connection thePrinterConn = new BluetoothConnectionInsecure(mac);
-
-                    // if (isPrinterReady(thePrinterConn)) {
+                    // Cancela qualquer descoberta bluetooth em andamento: exigencia do Android antes de conectar e acelera a conexao
+                    try {
+                        BluetoothAdapter bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
+                        if (bluetoothAdapter != null && bluetoothAdapter.isDiscovering()) {
+                            bluetoothAdapter.cancelDiscovery();
+                        }
+                    } catch (Exception se) { /* sem permissao de scan: segue sem cancelar */ }
 
                     // Initialize
                     Looper.prepare();
 
-                    // Open the connection - physical connection is established here.
-                    thePrinterConn.open();
+                    // Reutiliza a conexao persistente quando for a mesma impressora (elimina o tempo de abrir/fechar conexao a cada impressao)
+                    Connection conn = getCachedConnection(mac);
 
-                    SGD.SET("device.languages", "zpl", thePrinterConn);
-                    thePrinterConn.write(msg.getBytes());
-
-                    // Close the insecure connection to release resources.
-                    thePrinterConn.close();
+                    try {
+                        conn.write(msg.getBytes());
+                    } catch (Exception we) {
+                        // A conexao persistente caiu (impressora dormiu/desligou): reabre uma vez e tenta novamente
+                        closeCachedConnection();
+                        conn = getCachedConnection(mac);
+                        conn.write(msg.getBytes());
+                    }
 
                     Looper.myLooper().quit();
                     callbackContext.success("Done");
@@ -217,10 +230,42 @@ public class ZebraBluetoothPrinter extends CordovaPlugin implements DiscoveryHan
                     // }
                 } catch (Exception e) {
                     // Handle communications error here.
+                    closeCachedConnection();
                     callbackContext.error(e.getMessage());
                 }
             }
         }).start();
+    }
+
+    // abre (ou reutiliza) a conexao bluetooth persistente com a impressora
+    private synchronized Connection getCachedConnection(String mac) throws ConnectionException {
+        if (cachedPrinterConn != null && cachedPrinterMac.equals(mac) && cachedPrinterConn.isConnected()) {
+            return cachedPrinterConn;
+        }
+        closeCachedConnection();
+        Connection conn = new BluetoothConnectionInsecure(mac);
+        // Open the connection - physical connection is established here.
+        conn.open();
+        SGD.SET("device.languages", "zpl", conn);
+        cachedPrinterConn = conn;
+        cachedPrinterMac = mac;
+        return conn;
+    }
+
+    // fecha e descarta a conexao persistente
+    private synchronized void closeCachedConnection() {
+        if (cachedPrinterConn != null) {
+            try { cachedPrinterConn.close(); } catch (Exception e) { }
+            cachedPrinterConn = null;
+            cachedPrinterMac = "";
+        }
+    }
+
+    // garante a liberacao da conexao persistente quando o app encerra
+    @Override
+    public void onDestroy() {
+        closeCachedConnection();
+        super.onDestroy();
     }
 
     
@@ -299,6 +344,8 @@ public class ZebraBluetoothPrinter extends CordovaPlugin implements DiscoveryHan
 
         if (bluetoothAdapter.isEnabled()) {
             Log.d(LOG_TAG, "Creating a bluetooth-connection for mac-address " + MACAddress);
+
+            closeCachedConnection(); // evita duas conexoes simultaneas com a mesma impressora
 
             thePrinterConn = new BluetoothConnectionInsecure(MACAddress);
 
@@ -433,12 +480,12 @@ public class ZebraBluetoothPrinter extends CordovaPlugin implements DiscoveryHan
                         BluetoothDiscoverer.findPrinters(cordova.getActivity().getApplicationContext(), ZebraBluetoothPrinter.this);
                     } else {
                         Log.d(LOG_TAG, "Bluetooth is disabled...");
-                        callbackContext.error("Bluetooth is not on.");
+                        if (discoveryCallbackContext != null) { discoveryCallbackContext.error("Bluetooth is not on."); discoveryCallbackContext = null; }
                     }
 
                 } catch (ConnectionException e) {
                     Log.e(LOG_TAG, "Connection exception: " + e.getMessage());
-                    callbackContext.error(e.getMessage());
+                    if (discoveryCallbackContext != null) { discoveryCallbackContext.error(e.getMessage()); discoveryCallbackContext = null; }
                 } finally {
                     Looper.myLooper().quit();
                 }
@@ -484,9 +531,12 @@ public class ZebraBluetoothPrinter extends CordovaPlugin implements DiscoveryHan
     @Override
     public void foundPrinter(DiscoveredPrinter discoveredPrinter) {
         Log.d(LOG_TAG, "Printer found: " + discoveredPrinter.address);
-        if (!printerFound) {
-            printerFound = true;
-            callbackContext.success(discoveredPrinter.address);
+        printerFound = true;
+        if (discoveryCallbackContext != null) {
+            // keepCallback: mantem o canal aberto para listar TODAS as impressoras encontradas (antes so reportava a primeira)
+            PluginResult result = new PluginResult(PluginResult.Status.OK, discoveredPrinter.address);
+            result.setKeepCallback(true);
+            discoveryCallbackContext.sendPluginResult(result);
         }
     }
 
@@ -494,15 +544,23 @@ public class ZebraBluetoothPrinter extends CordovaPlugin implements DiscoveryHan
     @Override
     public void discoveryFinished() {
         Log.d(LOG_TAG, "Finished searching for printers...");
-        if (!printerFound) {
-            callbackContext.error("No printer found. If this problem persists, restart the printer.");
+        if (discoveryCallbackContext != null) {
+            if (!printerFound) {
+                discoveryCallbackContext.error("No printer found. If this problem persists, restart the printer.");
+            } else {
+                discoveryCallbackContext.error("Discovery finished.");
+            }
+            discoveryCallbackContext = null;
         }
     }
 
     @Override
     public void discoveryError(String s) {
         Log.e(LOG_TAG, "An error occurred while searching for printers. Message: " + s);
-        callbackContext.error(s);
+        if (discoveryCallbackContext != null) {
+            discoveryCallbackContext.error(s);
+            discoveryCallbackContext = null;
+        }
     }
 
 }
